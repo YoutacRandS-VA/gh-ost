@@ -8,9 +8,9 @@ require (
 	github.com/go-sql-driver/mysql v1.6.0
 	github.com/google/uuid v1.4.0
 	github.com/openark/golib v0.0.0-20210531070646-355f37940af8
-	golang.org/x/net v0.17.0
-	golang.org/x/term v0.13.0
-	golang.org/x/text v0.13.0
+	golang.org/x/net v0.23.0
+	golang.org/x/term v0.18.0
+	golang.org/x/text v0.14.0
 )
 
 require (
@@ -21,7 +21,7 @@ require (
 	github.com/siddontang/go-log v0.0.0-20180807004314-8d05993dda07 // indirect
 	github.com/smartystreets/goconvey v1.6.4 // indirect
 	go.uber.org/atomic v1.7.0 // indirect
-	golang.org/x/sys v0.13.0 // indirect
+	golang.org/x/sys v0.18.0 // indirect
 	gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c // indirect
 	gopkg.in/ini.v1 v1.62.0 // indirect
 )
