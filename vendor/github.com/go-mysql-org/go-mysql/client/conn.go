@@ -1,6 +1,8 @@
 package client
 
 import (
+	"bytes"
+	"context"
 	"crypto/tls"
 	"fmt"
 	"net"
@@ -9,6 +11,7 @@ import (
 
 	. "github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/packet"
+	"github.com/go-mysql-org/go-mysql/utils"
 	"github.com/pingcap/errors"
 )
 
@@ -21,7 +24,12 @@ type Conn struct {
 	tlsConfig *tls.Config
 	proto     string
 
+	// server capabilities
 	capability uint32
+	// client-set capabilities only
+	ccaps uint32
+
+	attributes map[string]string
 
 	status uint16
 
@@ -36,6 +44,12 @@ type Conn struct {
 // This function will be called for every row in resultset from ExecuteSelectStreaming.
 type SelectPerRowCallback func(row []FieldValue) error
 
+// This function will be called once per result from ExecuteSelectStreaming
+type SelectPerResultCallback func(result *Result) error
+
+// This function will be called once per result from ExecuteMultiple
+type ExecPerResultCallback func(result *Result, err error)
+
 func getNetProto(addr string) string {
 	proto := "tcp"
 	if strings.Contains(addr, "/") {
@@ -49,10 +63,23 @@ func getNetProto(addr string) string {
 func Connect(addr string, user string, password string, dbName string, options ...func(*Conn)) (*Conn, error) {
 	proto := getNetProto(addr)
 
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+	defer cancel()
+
+	dialer := &net.Dialer{}
+
+	return ConnectWithDialer(ctx, proto, addr, user, password, dbName, dialer.DialContext, options...)
+}
+
+// Dialer connects to the address on the named network using the provided context.
+type Dialer func(ctx context.Context, network, address string) (net.Conn, error)
+
+// Connect to a MySQL server using the given Dialer.
+func ConnectWithDialer(ctx context.Context, network string, addr string, user string, password string, dbName string, dialer Dialer, options ...func(*Conn)) (*Conn, error) {
 	c := new(Conn)
 
 	var err error
-	conn, err := net.DialTimeout(proto, addr, 10*time.Second)
+	conn, err := dialer(ctx, network, addr)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
@@ -66,9 +93,9 @@ func Connect(addr string, user string, password string, dbName string, options .
 	c.user = user
 	c.password = password
 	c.db = dbName
-	c.proto = proto
+	c.proto = network
 
-	//use default charset here, utf-8
+	// use default charset here, utf-8
 	c.charset = DEFAULT_CHARSET
 
 	// Apply configuration functions.
@@ -120,6 +147,16 @@ func (c *Conn) Ping() error {
 	return nil
 }
 
+// SetCapability enables the use of a specific capability
+func (c *Conn) SetCapability(cap uint32) {
+	c.ccaps |= cap
+}
+
+// UnsetCapability disables the use of a specific capability
+func (c *Conn) UnsetCapability(cap uint32) {
+	c.ccaps &= ^cap
+}
+
 // UseSSL: use default SSL
 // pass to options when connect
 func (c *Conn) UseSSL(insecureSkipVerify bool) {
@@ -168,8 +205,71 @@ func (c *Conn) Execute(command string, args ...interface{}) (*Result, error) {
 	}
 }
 
+// ExecuteMultiple will call perResultCallback for every result of the multiple queries
+// that are executed.
+//
+// When ExecuteMultiple is used, the connection should have the SERVER_MORE_RESULTS_EXISTS
+// flag set to signal the server multiple queries are executed. Handling the responses
+// is up to the implementation of perResultCallback.
+//
+// Example:
+//
+//      queries := "SELECT 1; SELECT NOW();"
+//      conn.ExecuteMultiple(queries, func(result *mysql.Result, err error) {
+//          // Use the result as you want
+//      })
+//
+func (c *Conn) ExecuteMultiple(query string, perResultCallback ExecPerResultCallback) (*Result, error) {
+	if err := c.writeCommandStr(COM_QUERY, query); err != nil {
+		return nil, errors.Trace(err)
+	}
+
+	var err error
+	var result *Result
+
+	bs := utils.ByteSliceGet(16)
+	defer utils.ByteSlicePut(bs)
+
+	for {
+		bs.B, err = c.ReadPacketReuseMem(bs.B[:0])
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+
+		switch bs.B[0] {
+		case OK_HEADER:
+			result, err = c.handleOKPacket(bs.B)
+		case ERR_HEADER:
+			err = c.handleErrorPacket(bytes.Repeat(bs.B, 1))
+			result = nil
+		case LocalInFile_HEADER:
+			err = ErrMalformPacket
+			result = nil
+		default:
+			result, err = c.readResultset(bs.B, false)
+		}
+		// call user-defined callback
+		perResultCallback(result, err)
+
+		// if there was an error of this was the last result, stop looping
+		if err != nil || result.Status&SERVER_MORE_RESULTS_EXISTS == 0 {
+			break
+		}
+	}
+
+	// return an empty result(set) signaling we're done streaming a multiple
+	// streaming session
+	// if this would end up in WriteValue, it would just be ignored as all
+	// responses should have been handled in perResultCallback
+	return &Result{Resultset: &Resultset{
+		Streaming:     StreamingMultiple,
+		StreamingDone: true,
+	}}, nil
+}
+
 // ExecuteSelectStreaming will call perRowCallback for every row in resultset
 //   WITHOUT saving any row data to Result.{Values/RawPkg/RowDatas} fields.
+// When given, perResultCallback will be called once per result
 //
 // ExecuteSelectStreaming should be used only for SELECT queries with a large response resultset for memory preserving.
 //
@@ -180,14 +280,14 @@ func (c *Conn) Execute(command string, args ...interface{}) (*Result, error) {
 //   		// Use the row as you want.
 //   		// You must not save FieldValue.AsString() value after this callback is done. Copy it if you need.
 //   		return nil
-// 		})
+// 		}, nil)
 //
-func (c *Conn) ExecuteSelectStreaming(command string, result *Result, perRowCallback SelectPerRowCallback) error {
+func (c *Conn) ExecuteSelectStreaming(command string, result *Result, perRowCallback SelectPerRowCallback, perResultCallback SelectPerResultCallback) error {
 	if err := c.writeCommandStr(COM_QUERY, command); err != nil {
 		return errors.Trace(err)
 	}
 
-	return c.readResultStreaming(false, result, perRowCallback)
+	return c.readResultStreaming(false, result, perRowCallback, perResultCallback)
 }
 
 func (c *Conn) Begin() error {
@@ -203,6 +303,10 @@ func (c *Conn) Commit() error {
 func (c *Conn) Rollback() error {
 	_, err := c.exec("ROLLBACK")
 	return errors.Trace(err)
+}
+
+func (c *Conn) SetAttributes(attributes map[string]string) {
+	c.attributes = attributes
 }
 
 func (c *Conn) SetCharset(charset string) error {
@@ -232,24 +336,23 @@ func (c *Conn) FieldList(table string, wildcard string) ([]*Field, error) {
 	var f *Field
 	if data[0] == ERR_HEADER {
 		return nil, c.handleErrorPacket(data)
-	} else {
-		for {
-			if data, err = c.ReadPacket(); err != nil {
-				return nil, errors.Trace(err)
-			}
-
-			// EOF Packet
-			if c.isEOFPacket(data) {
-				return fs, nil
-			}
-
-			if f, err = FieldData(data).Parse(); err != nil {
-				return nil, errors.Trace(err)
-			}
-			fs = append(fs, f)
-		}
 	}
-	return nil, fmt.Errorf("field list error")
+
+	for {
+		if data, err = c.ReadPacket(); err != nil {
+			return nil, errors.Trace(err)
+		}
+
+		// EOF Packet
+		if c.isEOFPacket(data) {
+			return fs, nil
+		}
+
+		if f, err = FieldData(data).Parse(); err != nil {
+			return nil, errors.Trace(err)
+		}
+		fs = append(fs, f)
+	}
 }
 
 func (c *Conn) SetAutoCommit() error {
